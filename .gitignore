@@ -1,0 +1,6 @@
+R
+node_modules
+*.pyc
+.*
+!.gitignore
+seaborn-data/

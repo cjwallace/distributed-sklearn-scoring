@@ -4,19 +4,18 @@
 # distributed data.
 
 import joblib
-import seaborn as sns
+
+import pandas as pd
+import pyspark.sql.functions as F
 
 from functools import reduce
 from pyspark.sql import SparkSession
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import pandas_udf, PandasUDFType
-from pyspark.sql.types import StructType, FloatType, StructField
+from pyspark.sql.types import DoubleType
+from sklearn.datasets import load_iris
 
-# Use the same canned dataset we trained on.
 
-data = sns.load_dataset('iris').drop('species', axis='columns')
-
-# Initialize a spark session
+# ## Initialize a spark session
 
 spark = (
     SparkSession
@@ -28,51 +27,62 @@ spark = (
 
 sc = spark.sparkContext
 
-# Create a spark dataframe.
+
+# ## Create a spark dataframe.
+
 # Out in the real world, we wouldn't have a canned dataset, and our data may
 # be much larger.
-# To replicate that, we'll artificially explode our data to a much larger set.
+# To replicate that, we'll create an artificial dataset from the train and test
+# data and replicate it to create a much larger set.
 
-df = spark.createDataFrame(data)
+iris = load_iris()
+X = iris.data
 
-big_df = reduce(DataFrame.unionAll, (df for i in range(10000)))
 
+# Since we're now just predicting, we don't need to split train/test.
+
+df = spark.createDataFrame(
+  pd.DataFrame(X).reset_index(),
+  schema=["id", "sepal_length", "sepal_width", "petal_length", "petal_width"]
+)
+
+
+# Artificially inflate the dataset to make spark do some work.
+
+big_df = reduce(DataFrame.unionAll, (df for i in range(1000)))
 big_df.count()
 
-# We could use pandas scalar UDFs, in which case we need a function that takes
-# pandas Series and returns pandas series.
-# Instead, we'll use the grouped map, which takes a grouped spark
-# dataframe and operates on each group as a pandas dataframe, then joins the
-# results.
-# To do this split, we must create an id to group by. For our purposes, we
-# don't care what the groups are - we just want to split the frame up to
-# distribute compute.
 
-# FIXME
+# Load the model from local memory and broadcast it to the cluster.
+# This makes the model object available on worker nodes.
 
-# Using pandas grouped map UDFs requires specifying the output schema of the
-# dataframe returned by the UDF.
-
-output_schema = StructType([
-  StructField('sepal_length', FloatType(), False),
-  StructField('sepal_width', FloatType(), False),
-  StructField('petal_length', FloatType(), False),
-  StructField('petal_width', FloatType(), False),
-  StructField('predicted_species', FloatType(), False)
-])
+local_model = joblib.load("model.pkl")
+broadcast_model = sc.broadcast(local_model)
 
 
-# Now use pandas UDFs to distribute a function
+# Create a pandas UDFs to distribute the predict function
 
-@pandas_udf(output_schema, PandasUDFType.GROUPED_MAP)
-def predict(df):
+@pandas_udf(returnType=DoubleType())
+def predict_udf(*cols):
     """
-    Takes a dataframe of iris flower features and returns the same dataframe
-    with a predicted species column appended.
+    Takes several iris flower features (each a pd.Series)
+    and returns a pd.Series of predicted species.
     """
-    df['predicted_species'] = model.predict(df)
-    return df
+    model = broadcast_model.value
+    X = pd.concat(cols, axis="columns")
+    predictions = pd.Series(model.predict(X))
+    return predictions
 
-model = joblib.load('model.pkl')
+# Define the input feature columns to pass to the UDF
+
+feature_columns = [c for c in big_df.columns if c != "id"]
 
 
+# Distribute scoring over the cluster
+
+predictions = big_df.select(
+  F.col("id"),
+  predict_udf(*feature_columns).alias('predicted_species')
+)
+
+predictions.show()
